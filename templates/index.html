@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>FFmpeg + Amharic Transcriber</title>
+    <style>
+        body { font-family: Arial; max-width: 800px; margin: auto; padding: 20px; }
+        .section { border: 1px solid #ccc; padding: 15px; margin-bottom: 20px; border-radius: 5px; }
+        input, select, button { margin: 5px 0; padding: 8px; width: 100%; box-sizing: border-box; }
+        button { background: #007bff; color: white; border: none; cursor: pointer; }
+        button:hover { background: #0056b3; }
+    </style>
+</head>
+<body>
+    <h1>🎬 FFmpeg Media Processor (Amharic Focus)</h1>
+
+    <div class="section">
+        <h2>Convert Format</h2>
+        <form action="/api/convert" method="post" enctype="multipart/form-data">
+            <input type="file" name="file" required>
+            <input type="text" name="output_format" placeholder="Output format (e.g., mp4, avi, mp3)" required>
+            <button type="submit">Convert</button>
+        </form>
+    </div>
+
+    <div class="section">
+        <h2>Trim Media</h2>
+        <form action="/api/trim" method="post" enctype="multipart/form-data">
+            <input type="file" name="file" required>
+            <input type="text" name="start" placeholder="Start (e.g., 00:01:30)" required>
+            <input type="text" name="end" placeholder="End (e.g., 00:02:45)" required>
+            <button type="submit">Trim</button>
+        </form>
+    </div>
+
+    <div class="section">
+        <h2>Extract Audio</h2>
+        <form action="/api/extract-audio" method="post" enctype="multipart/form-data">
+            <input type="file" name="file" required>
+            <select name="audio_format">
+                <option value="mp3">MP3</option>
+                <option value="wav">WAV</option>
+                <option value="aac">AAC</option>
+            </select>
+            <button type="submit">Extract</button>
+        </form>
+    </div>
+
+    <div class="section">
+        <h2>Transcribe to Subtitles (Amharic default)</h2>
+        <form action="/api/transcribe" method="post" enctype="multipart/form-data">
+            <input type="file" name="file" accept="audio/*,video/*" required>
+            <select name="language">
+                <option value="am">Amharic</option>
+                <option value="en">English</option>
+                <option value="fr">French</option>
+                <option value="es">Spanish</option>
+            </select>
+            <select name="task">
+                <option value="transcribe">Transcribe</option>
+                <option value="translate">Translate to English</option>
+            </select>
+            <button type="submit">Generate SRT</button>
+        </form>
+    </div>
+
+    <div class="section">
+        <h2>Burn Subtitles into Video</h2>
+        <form action="/api/burn-subtitles" method="post" enctype="multipart/form-data">
+            <input type="file" name="file" accept="video/*" required>
+            <input type="file" name="subtitle_file" accept=".srt,.vtt" required>
+            <button type="submit">Burn</button>
+        </form>
+    </div>
+
+    <p><strong>API Base URL:</strong> /api/ (see /docs for OpenAPI)</p>
+</body>
+</html>

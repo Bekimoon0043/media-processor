@@ -1,6 +1,7 @@
 FROM python:3.9-slim
 
-RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+# Install ffmpeg and a basic font for text overlay
+RUN apt-get update && apt-get install -y ffmpeg fonts-freefont-ttf && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -9,8 +10,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# No pre-download – will load on first request
-
-EXPOSE $PORT
-
+# Render sets the PORT environment variable
 CMD uvicorn app:app --host 0.0.0.0 --port $PORT

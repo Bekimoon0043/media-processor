@@ -3,10 +3,10 @@ import subprocess
 import tempfile
 import shutil
 import atexit
-import json
 from flask import Flask, request, send_file, render_template, jsonify
 from vosk import Model, KaldiRecognizer
 import wave
+import json
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100 MB limit
@@ -41,16 +41,24 @@ def register_temp_file(path):
 # Helper: group words into sentences
 # -------------------------------------------------------------------
 def group_words_into_sentences(words, max_gap=0.5):
-    """Group word timestamps into sentence segments."""
+    """
+    Group a list of word dicts (with 'start', 'end', 'word') into sentences.
+    A sentence ends when a word ends with punctuation (.!?) OR there is a gap
+    larger than max_gap between consecutive words.
+    Returns a list of dicts: {start, end, text}
+    """
     if not words:
         return []
+
     sentences = []
     current_words = [words[0]]
     prev_end = words[0]['end']
 
     for w in words[1:]:
         gap = w['start'] - prev_end
+        # Check if current word ends with punctuation or gap exceeds threshold
         if current_words[-1]['word'].endswith(('.', '!', '?')) or gap > max_gap:
+            # Finish current sentence
             sentence_text = ' '.join([wrd['word'] for wrd in current_words])
             sentences.append({
                 'start': current_words[0]['start'],
@@ -62,6 +70,7 @@ def group_words_into_sentences(words, max_gap=0.5):
             current_words.append(w)
         prev_end = w['end']
 
+    # Add last sentence
     if current_words:
         sentence_text = ' '.join([wrd['word'] for wrd in current_words])
         sentences.append({
@@ -69,20 +78,8 @@ def group_words_into_sentences(words, max_gap=0.5):
             'end': current_words[-1]['end'],
             'text': sentence_text
         })
-    return sentences
 
-# -------------------------------------------------------------------
-# Helper: get media duration using ffprobe
-# -------------------------------------------------------------------
-def get_duration(file_path):
-    cmd = [
-        'ffprobe', '-v', 'error', '-show_entries',
-        'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', file_path
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"ffprobe failed: {result.stderr}")
-    return float(result.stdout.strip())
+    return sentences
 
 # -------------------------------------------------------------------
 # Routes
@@ -118,7 +115,7 @@ def separate_audio():
 
 @app.route('/transcribe', methods=['POST'])
 def transcribe_audio():
-    """Transcribe uploaded audio using Vosk, return text, words, and sentences."""
+    """Transcribe uploaded audio using Vosk, return text, words, and sentences with timestamps."""
     if 'audio' not in request.files:
         return jsonify({'error': 'No audio file provided'}), 400
     audio_file = request.files['audio']
@@ -129,6 +126,7 @@ def transcribe_audio():
         audio_file.save(tmp_in.name)
         input_path = register_temp_file(tmp_in.name)
 
+    # Convert to 16kHz mono WAV
     wav_fd, wav_path = tempfile.mkstemp(suffix='.wav')
     os.close(wav_fd)
     register_temp_file(wav_path)
@@ -149,7 +147,7 @@ def transcribe_audio():
         return jsonify({'error': 'Audio file must be WAV format mono PCM.'}), 400
 
     recognizer = KaldiRecognizer(model, wf.getframerate())
-    recognizer.SetWords(True)
+    recognizer.SetWords(True)  # Enable word timestamps
 
     results_text = []
     all_words = []
@@ -172,6 +170,8 @@ def transcribe_audio():
         all_words.extend(final_res['result'])
 
     full_text = ' '.join(results_text).strip()
+
+    # Group words into sentences
     sentences = group_words_into_sentences(all_words)
 
     return jsonify({
@@ -225,141 +225,6 @@ def merge_video_audio():
         return jsonify({'error': f'ffmpeg merge failed: {e.stderr}'}), 500
 
     return send_file(out_path, as_attachment=True, download_name='merged.mp4')
-
-@app.route('/merge-translated', methods=['POST'])
-def merge_translated():
-    """
-    Merge video with translated audio aligned to original sentence timestamps.
-    Expects:
-        - video file (field 'video')
-        - sentences.json file (field 'sentences_json') containing a JSON array of {start, end}
-        - multiple audio files (field 'audio_files') in the same order as the sentences
-        - (optional) volume multiplier (field 'volume')
-    """
-    if 'video' not in request.files:
-        return jsonify({'error': 'No video file provided'}), 400
-    if 'sentences_json' not in request.files:
-        return jsonify({'error': 'No sentences JSON file provided'}), 400
-    if 'audio_files' not in request.files:
-        return jsonify({'error': 'No audio files provided'}), 400
-
-    video_file = request.files['video']
-    sentences_file = request.files['sentences_json']
-    audio_files = request.files.getlist('audio_files')
-
-    if video_file.filename == '':
-        return jsonify({'error': 'Empty video file'}), 400
-    if sentences_file.filename == '':
-        return jsonify({'error': 'Empty sentences JSON file'}), 400
-    if len(audio_files) == 0 or any(f.filename == '' for f in audio_files):
-        return jsonify({'error': 'Empty audio file(s)'}), 400
-
-    # Optional volume
-    volume = request.form.get('volume', '1.0')
-    try:
-        volume = float(volume)
-    except ValueError:
-        return jsonify({'error': 'Volume must be a number'}), 400
-
-    # Save video
-    with tempfile.NamedTemporaryFile(delete=False, suffix='_video') as tmp_video:
-        video_file.save(tmp_video.name)
-        video_path = register_temp_file(tmp_video.name)
-
-    # Load and parse sentences JSON
-    sentences_data = json.load(sentences_file)
-    if not isinstance(sentences_data, list):
-        return jsonify({'error': 'Sentences JSON must be an array'}), 400
-
-    # Validate each sentence has start and end
-    for s in sentences_data:
-        if 'start' not in s or 'end' not in s:
-            return jsonify({'error': 'Each sentence must have start and end fields'}), 400
-
-    # Number of sentences must match number of audio files
-    if len(sentences_data) != len(audio_files):
-        return jsonify({'error': f'Number of sentences ({len(sentences_data)}) does not match number of audio files ({len(audio_files)})'}), 400
-
-    # Save all audio files to temp
-    audio_paths = []
-    for i, af in enumerate(audio_files):
-        with tempfile.NamedTemporaryFile(delete=False, suffix=f'_audio_{i}') as tmp_audio:
-            af.save(tmp_audio.name)
-            audio_paths.append(register_temp_file(tmp_audio.name))
-
-    # Get total video duration
-    try:
-        video_duration = get_duration(video_path)
-    except Exception as e:
-        return jsonify({'error': f'Could not get video duration: {str(e)}'}), 500
-
-    # Verify each audio duration matches the corresponding sentence duration
-    for i, audio_path in enumerate(audio_paths):
-        try:
-            audio_dur = get_duration(audio_path)
-            sent_dur = sentences_data[i]['end'] - sentences_data[i]['start']
-            # Allow small tolerance (e.g., 0.1 seconds)
-            if abs(audio_dur - sent_dur) > 0.1:
-                return jsonify({
-                    'error': f'Audio duration for sentence {i} ({audio_dur:.2f}s) does not match original duration ({sent_dur:.2f}s)'
-                }), 400
-        except Exception as e:
-            return jsonify({'error': f'Could not get audio duration for sentence {i}: {str(e)}'}), 500
-
-    # Build filter_complex
-    # First input is the video (index 0), then all audio inputs (indices 1..N)
-    # We'll create a silent base of total video duration, then overlay each delayed audio.
-    filter_parts = []
-    audio_input_indices = []
-
-    # Generate silence of video duration
-    silence_label = 'silence'
-    filter_parts.append(f"aevalsrc=0::d={video_duration}[{silence_label}]")
-
-    # For each audio, apply adelay
-    delayed_labels = []
-    for i, (sentence, audio_path) in enumerate(zip(sentences_data, audio_paths)):
-        start_ms = int(sentence['start'] * 1000)  # adelay expects milliseconds
-        # adelay format: for each channel (assuming stereo, but we can just use same delay for all)
-        # We'll use "|" separated delays; for simplicity, assume 2 channels.
-        # We'll detect number of channels? Could use ffprobe but simpler: assume stereo, adelay works for mono too.
-        delay_filter = f"[{i+1}:a]adelay={start_ms}|{start_ms}[delayed{i}]"
-        filter_parts.append(delay_filter)
-        delayed_labels.append(f"[delayed{i}]")
-
-    # Combine all delayed audio with the silence using amix
-    # Inputs: silence + all delayed
-    all_inputs = f"[{silence_label}]" + "".join(delayed_labels)
-    mix_filter = f"{all_inputs}amix=inputs={1+len(delayed_labels)}:duration=longest:dropout_transition=0[audio_out]"
-    filter_parts.append(mix_filter)
-
-    # Apply volume adjustment to the final mixed audio
-    if volume != 1.0:
-        filter_parts.append(f"[audio_out]volume={volume}[audio_out]")
-
-    filter_complex = "; ".join(filter_parts)
-
-    # Build ffmpeg command
-    out_fd, out_path = tempfile.mkstemp(suffix='_translated_merged.mp4')
-    os.close(out_fd)
-    register_temp_file(out_path)
-
-    # Inputs: video first, then all audio files
-    cmd = ['ffmpeg', '-i', video_path] + [ '-i', ap for ap in audio_paths ] + [
-        '-filter_complex', filter_complex,
-        '-map', '0:v:0',
-        '-map', '[audio_out]',
-        '-c:v', 'copy',
-        '-c:a', 'aac',
-        '-y', out_path
-    ]
-
-    try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-    except subprocess.CalledProcessError as e:
-        return jsonify({'error': f'ffmpeg merge failed: {e.stderr}'}), 500
-
-    return send_file(out_path, as_attachment=True, download_name='translated_merged.mp4')
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))

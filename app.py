@@ -1,153 +1,183 @@
 import os
 import subprocess
 import tempfile
-import logging
-from pathlib import Path
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, BackgroundTasks
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
-from fastapi.templating import Jinja2Templates
+import shutil
+import atexit
+from flask import Flask, request, send_file, render_template, jsonify
+from vosk import Model, KaldiRecognizer
+import wave
+import json
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100 MB limit
 
-app = FastAPI(title="Custom Caption Overlay")
-templates = Jinja2Templates(directory="templates")
+# -------------------------------------------------------------------
+# Load Vosk model once at startup
+# -------------------------------------------------------------------
+MODEL_PATH = os.environ.get('VOSK_MODEL_PATH', 'model')
+if not os.path.exists(MODEL_PATH):
+    raise RuntimeError(f"Vosk model not found at {MODEL_PATH}. Please download it.")
+model = Model(MODEL_PATH)
 
-# Path to the font file (installed via fonts-freefont-ttf)
-FONT_PATH = "/usr/share/fonts/truetype/freefont/FreeSans.ttf"
+# -------------------------------------------------------------------
+# Helper: clean up temporary files after response
+# -------------------------------------------------------------------
+_temp_files = []
 
-def check_font():
-    if not os.path.exists(FONT_PATH):
-        logger.error(f"Font file not found at {FONT_PATH}")
-        raise RuntimeError(f"Required font missing: {FONT_PATH}")
-    logger.info(f"Font file found: {FONT_PATH}")
+def cleanup_temp_files():
+    for f in _temp_files:
+        try:
+            os.remove(f)
+        except:
+            pass
 
-def add_caption_overlay(input_path: str, output_path: str, caption: str):
-    """
-    Run ffmpeg to overlay the given caption on the video.
-    Text is yellow with black stroke and semi-transparent black background.
-    """
-    check_font()
-    
-    # Escape single quotes in caption for ffmpeg filter
-    caption_escaped = caption.replace("'", r"'\''")
-    
-    # drawtext filter:
-    # - text: user caption
-    # - fontcolor=yellow
-    # - borderw=3, bordercolor=black (black stroke)
-    # - box=1, boxcolor=black@0.5 (semi-transparent background)
-    # - boxborderw=10 (padding around text)
-    # - centered: x=(w-text_w)/2, y=(h-text_h)/2
+atexit.register(cleanup_temp_files)
+
+def register_temp_file(path):
+    _temp_files.append(path)
+    return path
+
+# -------------------------------------------------------------------
+# Routes
+# -------------------------------------------------------------------
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/separate', methods=['POST'])
+def separate_audio():
+    """Extract audio from uploaded video and return as MP3."""
+    if 'video' not in request.files:
+        return jsonify({'error': 'No video file provided'}), 400
+    video_file = request.files['video']
+    if video_file.filename == '':
+        return jsonify({'error': 'Empty file'}), 400
+
+    # Save uploaded video to a temporary file
+    with tempfile.NamedTemporaryFile(delete=False, suffix='_input_video') as tmp_in:
+        video_file.save(tmp_in.name)
+        input_path = register_temp_file(tmp_in.name)
+
+    # Create a temporary output file for the audio
+    output_fd, output_path = tempfile.mkstemp(suffix='.mp3')
+    os.close(output_fd)
+    register_temp_file(output_path)
+
+    # Run ffmpeg to extract audio
     cmd = [
-        "ffmpeg",
-        "-i", input_path,
-        "-vf", f"drawtext=text='{caption_escaped}':fontfile={FONT_PATH}:fontsize=48:fontcolor=yellow:x=(w-text_w)/2:y=(h-text_h)/2:box=1:boxcolor=black@0.5:boxborderw=10:borderw=3:bordercolor=black",
-        "-codec:a", "copy",
-        "-y", output_path
+        'ffmpeg', '-i', input_path,
+        '-vn', '-acodec', 'libmp3lame',
+        '-y', output_path
     ]
-    
-    logger.info(f"Running ffmpeg command: {' '.join(cmd)}")
-    
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        if result.returncode != 0:
-            logger.error(f"FFmpeg stderr: {result.stderr}")
-            raise HTTPException(status_code=500, detail=f"FFmpeg error: {result.stderr}")
-        
-        logger.info("FFmpeg completed successfully")
-        
-        # Verify output file exists and is not empty
-        if not os.path.exists(output_path):
-            raise HTTPException(status_code=500, detail="Output file was not created")
-        if os.path.getsize(output_path) == 0:
-            raise HTTPException(status_code=500, detail="Output file is empty")
-        
-        return output_path
-    except subprocess.TimeoutExpired:
-        logger.error("FFmpeg process timed out after 60 seconds")
-        raise HTTPException(status_code=504, detail="Processing timeout (max 60 seconds)")
-    except Exception as e:
-        logger.exception("Unexpected error during ffmpeg execution")
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        return jsonify({'error': f'ffmpeg failed: {e.stderr}'}), 500
 
-@app.get("/", response_class=HTMLResponse)
-async def home(request: Request):
-    """Serve the upload form."""
-    return templates.TemplateResponse("index.html", {"request": request})
+    return send_file(output_path, as_attachment=True, download_name='audio.mp3')
 
-@app.get("/health", response_class=JSONResponse)
-async def health_check():
-    """Health check endpoint for Render."""
-    return {"status": "healthy", "font_ok": os.path.exists(FONT_PATH)}
+@app.route('/transcribe', methods=['POST'])
+def transcribe_audio():
+    """Transcribe uploaded audio using Vosk."""
+    if 'audio' not in request.files:
+        return jsonify({'error': 'No audio file provided'}), 400
+    audio_file = request.files['audio']
+    if audio_file.filename == '':
+        return jsonify({'error': 'Empty file'}), 400
 
-@app.post("/process")
-async def process_video(
-    file: UploadFile = File(...),
-    caption: str = Form(...),
-    background_tasks: BackgroundTasks = None
-):
-    """
-    Upload a video and a caption, overlay the caption on the video,
-    and return the result.
-    """
-    # Validate file type
-    if not file.content_type or not file.content_type.startswith("video/"):
-        raise HTTPException(status_code=400, detail="Uploaded file must be a video")
-    
-    # Determine file extension
-    suffix = Path(file.filename).suffix
-    if not suffix:
-        suffix = ".mp4"  # default if no extension
-    
-    # Temporary input file
+    # Save uploaded audio to a temporary file
+    with tempfile.NamedTemporaryFile(delete=False, suffix='_input_audio') as tmp_in:
+        audio_file.save(tmp_in.name)
+        input_path = register_temp_file(tmp_in.name)
+
+    # Convert audio to 16kHz mono WAV using ffmpeg (required by Vosk)
+    wav_fd, wav_path = tempfile.mkstemp(suffix='.wav')
+    os.close(wav_fd)
+    register_temp_file(wav_path)
+
+    convert_cmd = [
+        'ffmpeg', '-i', input_path,
+        '-ar', '16000', '-ac', '1',
+        '-c:a', 'pcm_s16le',
+        '-y', wav_path
+    ]
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_in:
-            content = await file.read()
-            tmp_in.write(content)
-            tmp_in_path = tmp_in.name
-            logger.info(f"Saved uploaded file to {tmp_in_path}, size: {len(content)} bytes")
-    except Exception as e:
-        logger.exception("Failed to save uploaded file")
-        raise HTTPException(status_code=500, detail="Could not save uploaded file")
-    
-    # Temporary output file
-    tmp_out_path = tempfile.NamedTemporaryFile(delete=False, suffix=suffix).name
-    
+        subprocess.run(convert_cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        return jsonify({'error': f'ffmpeg conversion failed: {e.stderr}'}), 500
+
+    # Open the WAV file with wave module
+    wf = wave.open(wav_path, 'rb')
+    if wf.getnchannels() != 1 or wf.getsampwidth() != 2 or wf.getcomptype() != 'NONE':
+        return jsonify({'error': 'Audio file must be WAV format mono PCM.'}), 400
+
+    recognizer = KaldiRecognizer(model, wf.getframerate())
+    recognizer.SetWords(False)
+
+    results = []
+    while True:
+        data = wf.readframes(4000)
+        if len(data) == 0:
+            break
+        if recognizer.AcceptWaveform(data):
+            res = json.loads(recognizer.Result())
+            results.append(res.get('text', ''))
+    final_res = json.loads(recognizer.FinalResult())
+    results.append(final_res.get('text', ''))
+
+    full_text = ' '.join(results).strip()
+    return jsonify({'text': full_text})
+
+@app.route('/merge', methods=['POST'])
+def merge_video_audio():
+    """Merge uploaded video and audio, adjusting volume."""
+    if 'video' not in request.files or 'audio' not in request.files:
+        return jsonify({'error': 'Both video and audio files are required'}), 400
+    video_file = request.files['video']
+    audio_file = request.files['audio']
+    if video_file.filename == '' or audio_file.filename == '':
+        return jsonify({'error': 'Empty file(s)'}), 400
+
+    # Get volume factor (default 1.0)
+    volume = request.form.get('volume', '1.0')
     try:
-        # Process the video with caption
-        add_caption_overlay(tmp_in_path, tmp_out_path, caption)
-        
-        # Schedule cleanup of temporary files after response is sent
-        if background_tasks:
-            background_tasks.add_task(os.unlink, tmp_in_path)
-            background_tasks.add_task(os.unlink, tmp_out_path)
-        else:
-            # Fallback: delete input now (output will be cleaned later)
-            os.unlink(tmp_in_path)
-        
-        # Return the processed file
-        return FileResponse(
-            tmp_out_path,
-            media_type="video/mp4",
-            filename=f"captioned_{file.filename}"
-        )
-    except HTTPException:
-        # Clean up input file if it exists
-        if 'tmp_in_path' in locals() and os.path.exists(tmp_in_path):
-            try:
-                os.unlink(tmp_in_path)
-            except Exception as e:
-                logger.warning(f"Could not delete input file {tmp_in_path}: {e}")
-        # Re-raise the HTTP exception
-        raise
-    except Exception as e:
-        logger.exception("Unhandled exception in /process")
-        # Clean up input file
-        if 'tmp_in_path' in locals() and os.path.exists(tmp_in_path):
-            try:
-                os.unlink(tmp_in_path)
-            except Exception as e:
-                logger.warning(f"Could not delete input file {tmp_in_path}: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+        volume = float(volume)
+    except ValueError:
+        return jsonify({'error': 'Volume must be a number'}), 400
+
+    # Save uploaded files
+    with tempfile.NamedTemporaryFile(delete=False, suffix='_video') as tmp_video:
+        video_file.save(tmp_video.name)
+        video_path = register_temp_file(tmp_video.name)
+    with tempfile.NamedTemporaryFile(delete=False, suffix='_audio') as tmp_audio:
+        audio_file.save(tmp_audio.name)
+        audio_path = register_temp_file(tmp_audio.name)
+
+    # Output merged file
+    out_fd, out_path = tempfile.mkstemp(suffix='_merged.mp4')
+    os.close(out_fd)
+    register_temp_file(out_path)
+
+    # ffmpeg command: copy video stream, encode audio with volume filter
+    cmd = [
+        'ffmpeg',
+        '-i', video_path,
+        '-i', audio_path,
+        '-filter:a', f'volume={volume}',
+        '-c:v', 'copy',
+        '-c:a', 'aac',
+        '-map', '0:v:0',
+        '-map', '1:a:0',
+        '-shortest',
+        '-y', out_path
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        return jsonify({'error': f'ffmpeg merge failed: {e.stderr}'}), 500
+
+    return send_file(out_path, as_attachment=True, download_name='merged.mp4')
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)

@@ -38,6 +38,50 @@ def register_temp_file(path):
     return path
 
 # -------------------------------------------------------------------
+# Helper: group words into sentences
+# -------------------------------------------------------------------
+def group_words_into_sentences(words, max_gap=0.5):
+    """
+    Group a list of word dicts (with 'start', 'end', 'word') into sentences.
+    A sentence ends when a word ends with punctuation (.!?) OR there is a gap
+    larger than max_gap between consecutive words.
+    Returns a list of dicts: {start, end, text}
+    """
+    if not words:
+        return []
+
+    sentences = []
+    current_words = [words[0]]
+    prev_end = words[0]['end']
+
+    for w in words[1:]:
+        gap = w['start'] - prev_end
+        # Check if current word ends with punctuation or gap exceeds threshold
+        if current_words[-1]['word'].endswith(('.', '!', '?')) or gap > max_gap:
+            # Finish current sentence
+            sentence_text = ' '.join([wrd['word'] for wrd in current_words])
+            sentences.append({
+                'start': current_words[0]['start'],
+                'end': current_words[-1]['end'],
+                'text': sentence_text
+            })
+            current_words = [w]
+        else:
+            current_words.append(w)
+        prev_end = w['end']
+
+    # Add last sentence
+    if current_words:
+        sentence_text = ' '.join([wrd['word'] for wrd in current_words])
+        sentences.append({
+            'start': current_words[0]['start'],
+            'end': current_words[-1]['end'],
+            'text': sentence_text
+        })
+
+    return sentences
+
+# -------------------------------------------------------------------
 # Routes
 # -------------------------------------------------------------------
 @app.route('/')
@@ -53,22 +97,15 @@ def separate_audio():
     if video_file.filename == '':
         return jsonify({'error': 'Empty file'}), 400
 
-    # Save uploaded video to a temporary file
     with tempfile.NamedTemporaryFile(delete=False, suffix='_input_video') as tmp_in:
         video_file.save(tmp_in.name)
         input_path = register_temp_file(tmp_in.name)
 
-    # Create a temporary output file for the audio
     output_fd, output_path = tempfile.mkstemp(suffix='.mp3')
     os.close(output_fd)
     register_temp_file(output_path)
 
-    # Run ffmpeg to extract audio
-    cmd = [
-        'ffmpeg', '-i', input_path,
-        '-vn', '-acodec', 'libmp3lame',
-        '-y', output_path
-    ]
+    cmd = ['ffmpeg', '-i', input_path, '-vn', '-acodec', 'libmp3lame', '-y', output_path]
     try:
         subprocess.run(cmd, check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError as e:
@@ -78,19 +115,18 @@ def separate_audio():
 
 @app.route('/transcribe', methods=['POST'])
 def transcribe_audio():
-    """Transcribe uploaded audio using Vosk and return text + word timestamps."""
+    """Transcribe uploaded audio using Vosk, return text, words, and sentences with timestamps."""
     if 'audio' not in request.files:
         return jsonify({'error': 'No audio file provided'}), 400
     audio_file = request.files['audio']
     if audio_file.filename == '':
         return jsonify({'error': 'Empty file'}), 400
 
-    # Save uploaded audio to a temporary file
     with tempfile.NamedTemporaryFile(delete=False, suffix='_input_audio') as tmp_in:
         audio_file.save(tmp_in.name)
         input_path = register_temp_file(tmp_in.name)
 
-    # Convert audio to 16kHz mono WAV using ffmpeg (required by Vosk)
+    # Convert to 16kHz mono WAV
     wav_fd, wav_path = tempfile.mkstemp(suffix='.wav')
     os.close(wav_fd)
     register_temp_file(wav_path)
@@ -106,7 +142,6 @@ def transcribe_audio():
     except subprocess.CalledProcessError as e:
         return jsonify({'error': f'ffmpeg conversion failed: {e.stderr}'}), 500
 
-    # Open the WAV file with wave module
     wf = wave.open(wav_path, 'rb')
     if wf.getnchannels() != 1 or wf.getsampwidth() != 2 or wf.getcomptype() != 'NONE':
         return jsonify({'error': 'Audio file must be WAV format mono PCM.'}), 400
@@ -136,9 +171,13 @@ def transcribe_audio():
 
     full_text = ' '.join(results_text).strip()
 
+    # Group words into sentences
+    sentences = group_words_into_sentences(all_words)
+
     return jsonify({
         'text': full_text,
-        'words': all_words   # each word: {word, conf, start, end}
+        'words': all_words,
+        'sentences': sentences
     })
 
 @app.route('/merge', methods=['POST'])
@@ -151,14 +190,12 @@ def merge_video_audio():
     if video_file.filename == '' or audio_file.filename == '':
         return jsonify({'error': 'Empty file(s)'}), 400
 
-    # Get volume factor (default 1.0)
     volume = request.form.get('volume', '1.0')
     try:
         volume = float(volume)
     except ValueError:
         return jsonify({'error': 'Volume must be a number'}), 400
 
-    # Save uploaded files
     with tempfile.NamedTemporaryFile(delete=False, suffix='_video') as tmp_video:
         video_file.save(tmp_video.name)
         video_path = register_temp_file(tmp_video.name)
@@ -166,12 +203,10 @@ def merge_video_audio():
         audio_file.save(tmp_audio.name)
         audio_path = register_temp_file(tmp_audio.name)
 
-    # Output merged file
     out_fd, out_path = tempfile.mkstemp(suffix='_merged.mp4')
     os.close(out_fd)
     register_temp_file(out_path)
 
-    # ffmpeg command: copy video stream, encode audio with volume filter
     cmd = [
         'ffmpeg',
         '-i', video_path,
